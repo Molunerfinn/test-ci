@@ -1,0 +1,728 @@
+name: picgo-hub preview
+run-name: picgo-hub-preview:${{ inputs.request_id }}
+# Migrated from PicGo/picgo-hub .github/workflows/deploy-preview.yml. picgo-bot dispatches it when a pull request is
+# opened, reopened, or synchronized, or gains the preview:force-pages label, and mirrors each job below back to
+# picgo-hub as a check run named after the job, so job names are a protocol. This repository is public: never print
+# configuration, and keep secrets in step-level env only.
+# yamllint disable rule:line-length
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: UUID identifying the originating picgo-hub event
+        required: true
+        type: string
+      event_name:
+        description: Source event (pull_request)
+        required: true
+        type: string
+      head_sha:
+        description: Immutable pull request head commit
+        required: true
+        type: string
+      base_sha:
+        description: Immutable pull request base commit
+        required: true
+        type: string
+      target_branch:
+        description: Pull request base branch
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      head_ref:
+        description: Pull request head branch
+        required: true
+        type: string
+      force_pages:
+        description: Rebuild Portal and Admin previews regardless of changes (true or false)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picgo-hub-preview-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+# Derived from inputs only (no secrets). Run scripts read these as shell variables, never through expressions.
+env:
+  PR_NUMBER: ${{ inputs.pr_number }}
+  WORKER_NAME: picgo-worker-pr-${{ inputs.pr_number }}
+  PR_API_DOMAIN: pr-${{ inputs.pr_number }}-dev-api.picgo.app
+  PR_PORTAL_DOMAIN: pr-${{ inputs.pr_number }}-dev-cloud.picgo.app
+  PR_ADMIN_DOMAIN: pr-${{ inputs.pr_number }}-dev-admin.picgo.app
+  PR_MEDIA_DOMAIN: pr-${{ inputs.pr_number }}.picgocloud.com
+
+jobs:
+  # Worker unit tests gate the Worker, Portal, and Admin deployments.
+  test-worker:
+    runs-on: ubuntu-latest
+    name: Test Worker
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: picgo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Run worker tests
+        working-directory: hub/packages/worker
+        env:
+          UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
+        run: |
+          pnpm test:castaly-config
+          node --test ../../.github/scripts/preview-pages.test.mjs
+          pnpm test:pure
+          pnpm test:local
+
+  # Creates the Neon branch, runs migrations, and creates or updates Hyperdrive. Every step is idempotent, so a run
+  # cancelled mid-setup by a newer push is repaired by the next run instead of orphaning the preview environment.
+  setup-env:
+    runs-on: ubuntu-latest
+    name: Setup Neon Branch && Hyperdrive
+    outputs:
+      hyperdrive_id: ${{ steps.create-hyperdrive.outputs.id }}
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Create Neon Branch
+        id: create-branch
+        uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch_name: pr-${{ inputs.pr_number }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          role: neondb_owner
+          parent_branch: dev
+
+      - name: Run Migrations
+        working-directory: hub/packages/worker
+        env:
+          DATABASE_URL: ${{ steps.create-branch.outputs.db_url }}
+        run: pnpm db:migrate
+
+      - name: Create or Update Hyperdrive
+        id: create-hyperdrive
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DB_URL: ${{ steps.create-branch.outputs.db_url }}
+        run: |
+          HYPERDRIVE_NAME="picgo-pr-${PR_NUMBER}"
+          # Parse with Node's URL from the environment so special characters survive intact.
+          DB_USER=$(node -e "const u = new URL(process.env.DB_URL); console.log(u.username)")
+          DB_PASS=$(node -e "const u = new URL(process.env.DB_URL); console.log(u.password)")
+          DB_HOST=$(node -e "const u = new URL(process.env.DB_URL); console.log(u.hostname)")
+          DB_PORT=$(node -e "const u = new URL(process.env.DB_URL); console.log(u.port || 5432)")
+          DB_NAME=neondb
+          # Logs are public: mask every connection detail before anything else can echo it.
+          for value in "$DB_USER" "$DB_PASS" "$DB_HOST"; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+
+          # Build the payload with jq; the scheme is always postgres.
+          PAYLOAD=$(jq -n \
+            --arg name "$HYPERDRIVE_NAME" \
+            --arg host "$DB_HOST" \
+            --argjson port "$DB_PORT" \
+            --arg database "$DB_NAME" \
+            --arg user "$DB_USER" \
+            --arg password "$DB_PASS" \
+            '{
+              name: $name,
+              origin: {
+                scheme: "postgres",
+                host: $host,
+                port: $port,
+                database: $database,
+                user: $user,
+                password: $password,
+                private_host: false
+              },
+              caching: { disabled: false },
+              mtls: {}
+            }')
+
+          RESPONSE=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          echo "$RESPONSE" | jq -e '.success == true' > /dev/null
+
+          EXISTING=$(echo "$RESPONSE" | jq -r --arg name "$HYPERDRIVE_NAME" '.result[] | select(.name == $name) | .id // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing Hyperdrive config."
+            UPDATE_RESULT=$(curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs/${EXISTING}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$PAYLOAD")
+            echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null
+            echo "id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            echo "Creating new Hyperdrive config."
+            RESULT=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$PAYLOAD")
+            echo "$RESULT" | jq -e '.success == true' > /dev/null
+            ID=$(echo "$RESULT" | jq -r '.result.id')
+            echo "id=$ID" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Deploys the PR Worker; wrangler creates the custom domains and DNS records.
+  deploy-worker:
+    runs-on: ubuntu-latest
+    name: Deploy PR Worker (API)
+    needs: [setup-env, test-worker]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      needs.test-worker.result == 'success' &&
+      (needs.setup-env.result == 'success' || needs.setup-env.result == 'skipped')
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Fetch Hyperdrive ID
+        id: fetch-hyperdrive
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          HYPERDRIVE_NAME="picgo-pr-${PR_NUMBER}"
+          ID=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            | jq -r --arg name "$HYPERDRIVE_NAME" '.result[] | select(.name == $name) | .id // empty')
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Patch wrangler.jsonc for PR
+        working-directory: hub/packages/worker
+        env:
+          SETUP_HYPERDRIVE_ID: ${{ needs.setup-env.outputs.hyperdrive_id }}
+          FETCHED_HYPERDRIVE_ID: ${{ steps.fetch-hyperdrive.outputs.id }}
+        run: |
+          # Queue preview setup was removed with the CSAM queue pipeline deprecation.
+
+          # Worker name
+          sed -i "s/\"name\": \"picgo-worker-staging\"/\"name\": \"${WORKER_NAME}\"/g" wrangler.jsonc
+
+          # Hyperdrive ID: prefer this run's setup output, fall back to the API lookup.
+          HYPERDRIVE_ID="$SETUP_HYPERDRIVE_ID"
+          if [ -z "$HYPERDRIVE_ID" ]; then
+            HYPERDRIVE_ID="$FETCHED_HYPERDRIVE_ID"
+          fi
+          if ! [[ "$HYPERDRIVE_ID" =~ ^[A-Za-z0-9-]*$ ]]; then
+            echo "::error::Malformed Hyperdrive ID."
+            exit 1
+          fi
+          sed -i "s/__HYPERDRIVE_ID__/${HYPERDRIVE_ID}/g" wrangler.jsonc
+
+          # PUBLIC_APP_BASE_URL
+          sed -i "s|\"PUBLIC_APP_BASE_URL\": \"https://dev-cloud.picgo.app\"|\"PUBLIC_APP_BASE_URL\": \"https://${PR_PORTAL_DOMAIN}\"|g" wrangler.jsonc
+
+          # Media domain: PR environments use pr-{n}.picgocloud.com
+          sed -i "s|\"DEFAULT_MEDIA_HOST\": \"dev.picgocloud.com\"|\"DEFAULT_MEDIA_HOST\": \"${PR_MEDIA_DOMAIN}\"|g" wrangler.jsonc
+          sed -i "s|\"CUSTOM_DOMAIN_CNAME_TARGET\": \"dev.picgocloud.com\"|\"CUSTOM_DOMAIN_CNAME_TARGET\": \"${PR_MEDIA_DOMAIN}\"|g" wrangler.jsonc
+          sed -i "s|\"CUSTOM_DOMAIN_WORKER_SCRIPT_NAME\": \"picgo-worker-staging\"|\"CUSTOM_DOMAIN_WORKER_SCRIPT_NAME\": \"${WORKER_NAME}\"|g" wrangler.jsonc
+
+          # Enable PR routes (API + media domain)
+          sed -i "s|// \"routes\": \[{ \"pattern\": \"__PR_API_DOMAIN__\", \"custom_domain\": true }, { \"pattern\": \"__PR_MEDIA_DOMAIN__\", \"custom_domain\": true }, { \"pattern\": \"__PR_MEDIA_DOMAIN__/\*\", \"zone_name\": \"picgocloud.com\" }\], // __PR_ROUTES__|\"routes\": [{ \"pattern\": \"${PR_API_DOMAIN}\", \"custom_domain\": true }, { \"pattern\": \"${PR_MEDIA_DOMAIN}\", \"custom_domain\": true }, { \"pattern\": \"${PR_MEDIA_DOMAIN}/*\", \"zone_name\": \"picgocloud.com\" }],|g" wrangler.jsonc
+
+          # The patched file is deliberately not printed: this repository's logs are public.
+
+      - name: Remove legacy Queue consumer binding
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Old preview Workers may still be attached as queue consumers on the Cloudflare side. Detach them before
+          # deploy so a script without a queue handler can be published safely.
+          QUEUE_NAME="media-moderation-queue-pr-${PR_NUMBER}"
+
+          QUEUE_ID=$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | jq -r --arg queue_name "$QUEUE_NAME" '.result[]? | select(.queue_name == $queue_name) | .queue_id // empty' \
+            | head -n 1)
+
+          if [ -z "$QUEUE_ID" ]; then
+            echo "Queue not found, skip consumer cleanup: ${QUEUE_NAME}"
+            exit 0
+          fi
+
+          CONSUMER_ID=$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues/${QUEUE_ID}/consumers" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | jq -r --arg worker_name "$WORKER_NAME" '.result[]? | select(.script_name == $worker_name) | .consumer_id // empty' \
+            | head -n 1)
+
+          if [ -z "$CONSUMER_ID" ]; then
+            echo "Queue consumer binding not found, skip cleanup: ${QUEUE_NAME} -> ${WORKER_NAME}"
+            exit 0
+          fi
+
+          echo "Removing legacy queue consumer binding: ${QUEUE_NAME} -> ${WORKER_NAME}"
+          DELETE_RESPONSE=$(curl -sS -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues/${QUEUE_ID}/consumers/${CONSUMER_ID}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          echo "$DELETE_RESPONSE" | jq -e '.success == true' > /dev/null
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: 'hub/packages/worker'
+          command: deploy
+          secrets: |
+            CLOUDFLARE_ACCOUNT_ID
+            CLOUDFLARE_API_TOKEN
+            CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID
+            CLOUDFLARE_CUSTOM_HOSTNAMES_API_TOKEN
+            CREEM_API_KEY
+            CREEM_WEBHOOK_SECRET
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID: ${{ secrets.CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID }}
+          CLOUDFLARE_CUSTOM_HOSTNAMES_API_TOKEN: ${{ secrets.CLOUDFLARE_CUSTOM_HOSTNAMES_API_TOKEN }}
+          CREEM_API_KEY: ${{ secrets.CREEM_API_KEY }}
+          CREEM_WEBHOOK_SECRET: ${{ secrets.CREEM_WEBHOOK_SECRET }}
+
+  # Decides whether the Portal/Admin previews are missing or stale. The source is the PR head itself (not a local
+  # merge commit), so the commit Cloudflare Pages recorded for the last deployment stays reachable for git diff.
+  detect-pages-changes:
+    runs-on: ubuntu-latest
+    name: Detect Pages Changes
+    needs: [setup-env]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.setup-env.result == 'success'
+    outputs:
+      portal_changed: ${{ steps.detect.outputs.portal_changed }}
+      admin_changed: ${{ steps.detect.outputs.admin_changed }}
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          fetch-depth: '0'
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      # Runs inside hub/ because the script's git diff uses the current directory as the repository.
+      - name: Detect missing or changed Portal/Admin previews
+        id: detect
+        working-directory: hub
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          FORCE_PAGES: ${{ inputs.force_pages }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID_PICGO_APP }}
+        run: node .github/scripts/preview-pages.mjs detect
+
+  deploy-portal:
+    runs-on: ubuntu-latest
+    name: Deploy Portal Preview
+    needs: [detect-pages-changes, test-worker]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.test-worker.result == 'success' &&
+      needs.detect-pages-changes.result == 'success' &&
+      needs.detect-pages-changes.outputs.portal_changed == 'true'
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Clean dist
+        run: rm -rf hub/packages/portal/dist
+
+      - name: Build Portal
+        working-directory: hub/packages/portal
+        run: pnpm build
+        env:
+          VITE_API_BASE: https://${{ env.PR_API_DOMAIN }}
+          GITHUB_REF_NAME: ${{ inputs.head_ref }}
+          # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
+          CF_PAGES_BRANCH: ${{ inputs.head_ref }}
+
+      # Deploying from inside the source checkout records the picgo-hub head commit, which the next detect diffs.
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hub
+          command: pages deploy packages/portal/dist --project-name=picgo-portal --branch=pr-${{ inputs.pr_number }} --commit-hash=${{ inputs.head_sha }}
+
+      - name: Ensure Portal custom domain points to PR branch
+        working-directory: hub
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID_PICGO_APP }}
+        run: node .github/scripts/preview-pages.mjs ensure-domain portal
+
+  deploy-admin:
+    runs-on: ubuntu-latest
+    name: Deploy Admin Preview
+    needs: [detect-pages-changes, test-worker]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.test-worker.result == 'success' &&
+      needs.detect-pages-changes.result == 'success' &&
+      needs.detect-pages-changes.outputs.admin_changed == 'true'
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Clean dist
+        run: rm -rf hub/packages/admin/dist
+
+      - name: Build Admin
+        working-directory: hub/packages/admin
+        run: pnpm build
+        env:
+          VITE_API_BASE: https://${{ env.PR_API_DOMAIN }}
+          GITHUB_REF_NAME: ${{ inputs.head_ref }}
+          # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
+          CF_PAGES_BRANCH: ${{ inputs.head_ref }}
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hub
+          command: pages deploy packages/admin/dist --project-name=picgo-admin --branch=pr-${{ inputs.pr_number }} --commit-hash=${{ inputs.head_sha }}
+
+      - name: Ensure Admin custom domain points to PR branch
+        working-directory: hub
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID_PICGO_APP }}
+        run: node .github/scripts/preview-pages.mjs ensure-domain admin
+
+  comment-preview:
+    runs-on: ubuntu-latest
+    name: Comment Preview Result
+    needs: [test-worker, setup-env, deploy-worker, detect-pages-changes, deploy-portal, deploy-admin]
+    if: always() && !cancelled()
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: preview
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      # Pull requests: write covers the issue-comment endpoints for a pull request; the App has no Issues permission.
+      - name: Create a pull request comment token
+        id: comment-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          owner: PicGo
+          repositories: picgo-hub
+          permission-pull-requests: write
+
+      - name: Upsert preview comment
+        env:
+          GH_TOKEN: ${{ steps.comment-token.outputs.token }}
+          REPO: PicGo/picgo-hub
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_URL: https://${{ env.PR_API_DOMAIN }}
+          PORTAL_URL: https://${{ env.PR_PORTAL_DOMAIN }}
+          ADMIN_URL: https://${{ env.PR_ADMIN_DOMAIN }}
+          TEST_RESULT: ${{ needs.test-worker.result }}
+          SETUP_RESULT: ${{ needs.setup-env.result }}
+          WORKER_RESULT: ${{ needs.deploy-worker.result }}
+          DETECT_RESULT: ${{ needs.detect-pages-changes.result }}
+          PORTAL_CHANGED: ${{ needs.detect-pages-changes.outputs.portal_changed }}
+          ADMIN_CHANGED: ${{ needs.detect-pages-changes.outputs.admin_changed }}
+          PORTAL_RESULT: ${{ needs.deploy-portal.result }}
+          ADMIN_RESULT: ${{ needs.deploy-admin.result }}
+        run: |
+          COMMENT_MARKER="<!-- pr-preview-comment -->"
+
+          if [ "$TEST_RESULT" = "success" ] && \
+             [ "$WORKER_RESULT" = "success" ] && \
+             { [ "$SETUP_RESULT" = "success" ] || [ "$SETUP_RESULT" = "skipped" ]; } && \
+             [ "$DETECT_RESULT" = "success" ] && \
+             { [ "$PORTAL_CHANGED" != "true" ] || [ "$PORTAL_RESULT" = "success" ]; } && \
+             { [ "$ADMIN_CHANGED" != "true" ] || [ "$ADMIN_RESULT" = "success" ]; }; then
+            STATUS_LINE="- Status: success"
+            SUMMARY_LINE="> PR preview environment is ready."
+          else
+            STATUS_LINE="- Status: failed"
+            SUMMARY_LINE="> PR preview deployment did not complete successfully. Please check the workflow logs."
+          fi
+
+          deployment_note() {
+            if [ "$1" = "success" ]; then
+              echo "Updated in this run"
+            elif [ "$1" = "skipped" ] && [ "$2" = "false" ] && [ "$DETECT_RESULT" = "success" ]; then
+              echo "Reused verified existing preview (no build-input changes)"
+            else
+              echo "Not updated ($1)"
+            fi
+          }
+          WORKER_NOTE=$(deployment_note "$WORKER_RESULT" true)
+          PORTAL_NOTE=$(deployment_note "$PORTAL_RESULT" "$PORTAL_CHANGED")
+          ADMIN_NOTE=$(deployment_note "$ADMIN_RESULT" "$ADMIN_CHANGED")
+
+          BODY=$(printf '%s\n' \
+            "$COMMENT_MARKER" \
+            "## PR Preview Environment" \
+            "" \
+            "$STATUS_LINE" \
+            "- Workflow: [View run](${RUN_URL})" \
+            "" \
+            "| Service | URL | Notes |" \
+            "| --- | --- | --- |" \
+            "| Worker API | [${API_URL}](${API_URL}) | ${WORKER_NOTE} |" \
+            "| Portal | [${PORTAL_URL}](${PORTAL_URL}) | ${PORTAL_NOTE} |" \
+            "| Admin | [${ADMIN_URL}](${ADMIN_URL}) | ${ADMIN_NOTE} |" \
+            "" \
+            "$SUMMARY_LINE")
+
+          COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[] | select(.user.login == "picgo-bot[bot]") | select(.body | contains("<!-- pr-preview-comment -->")) | .id' | head -n 1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --method PATCH -f body="$BODY" > /dev/null
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --method POST -f body="$BODY" > /dev/null
+          fi

@@ -1,0 +1,11 @@
+{
+  "name": "test-ci",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \".github/picgo-hub/tests/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

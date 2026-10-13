@@ -1,0 +1,389 @@
+name: picgo-hub deploy
+run-name: picgo-hub-deploy:${{ inputs.request_id }}
+# Migrated from PicGo/picgo-hub .github/workflows/deploy.yml. picgo-bot dispatches it for pushes to main and
+# production and mirrors each job below back to picgo-hub as a check run named after the job, so job names are a
+# protocol. This repository is public: never print configuration, and keep secrets in step-level env only.
+# yamllint disable rule:line-length
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: UUID identifying the originating picgo-hub event
+        required: true
+        type: string
+      event_name:
+        description: Source event (push)
+        required: true
+        type: string
+      head_sha:
+        description: Immutable picgo-hub commit to deploy
+        required: true
+        type: string
+      base_sha:
+        description: Commit before the push, or the zero SHA
+        required: true
+        type: string
+      target_branch:
+        description: Pushed branch (main or production)
+        required: true
+        type: string
+      pr_number:
+        description: Always 0 for a push
+        required: true
+        type: string
+      head_ref:
+        description: Pushed branch name or empty
+        required: true
+        type: string
+      force_pages:
+        description: Always false for a push
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Deploys run database migrations, so an in-flight run must never be cancelled.
+concurrency:
+  group: picgo-hub-deploy-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: ${{ inputs.target_branch }}
+
+jobs:
+  test-worker:
+    runs-on: ubuntu-latest
+    name: Test Worker
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: picgo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: deploy
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Test Castaly deployment configuration
+        working-directory: hub/packages/worker
+        run: pnpm test:castaly-config
+
+      - name: Run worker tests
+        working-directory: hub/packages/worker
+        env:
+          UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
+        run: |
+          pnpm test:pure
+          pnpm test:local
+
+  deploy-worker:
+    runs-on: ubuntu-latest
+    name: Deploy Worker (API)
+    needs: test-worker
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: deploy
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Run Database Migrations
+        working-directory: hub/packages/worker
+        env:
+          DATABASE_URL: ${{ inputs.target_branch == 'production' && secrets.DATABASE_URL_PROD || secrets.DATABASE_URL_STAGING }}
+        run: pnpm db:migrate
+
+      - name: Replace placeholders in wrangler.jsonc
+        working-directory: hub/packages/worker
+        env:
+          PROD_HYPERDRIVE_ID: ${{ vars.CLOUDFLARE_HYPERDRIVE_ID }}
+          DEV_HYPERDRIVE_ID: ${{ vars.CLOUDFLARE_DEV_HYPERDRIVE_ID }}
+        run: |
+          if [ "$TARGET_BRANCH" = "production" ]; then
+            echo "Binding for Production..."
+            HYPERDRIVE_ID="$PROD_HYPERDRIVE_ID"
+          else
+            echo "Binding for Staging..."
+            HYPERDRIVE_ID="$DEV_HYPERDRIVE_ID"
+          fi
+          if ! [[ "$HYPERDRIVE_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+            echo "::error::The Hyperdrive ID variable is missing or malformed."
+            exit 1
+          fi
+          sed -i "s/__HYPERDRIVE_ID__/${HYPERDRIVE_ID}/g" wrangler.jsonc
+
+      - name: Set Environment Name
+        id: set-env
+        run: |
+          case "$TARGET_BRANCH" in
+            production) echo "TARGET_ENV=production" >> "$GITHUB_ENV" ;;
+            main) echo "TARGET_ENV=" >> "$GITHUB_ENV" ;;
+            *) echo "::error::Unsupported target branch."; exit 1 ;;
+          esac
+
+      - name: Remove legacy Queue consumer binding
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Old deployed Workers may still be attached as queue consumers on the Cloudflare side. Detach them before
+          # deploy so a script without a queue handler can be published safely.
+          if [ "$TARGET_BRANCH" = "production" ]; then
+            QUEUE_NAME="media-moderation-queue-prod"
+            WORKER_NAME="picgo-worker"
+          else
+            QUEUE_NAME="media-moderation-queue"
+            WORKER_NAME="picgo-worker-staging"
+          fi
+
+          QUEUE_ID=$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | jq -r --arg queue_name "$QUEUE_NAME" '.result[]? | select(.queue_name == $queue_name) | .queue_id // empty' \
+            | head -n 1)
+
+          if [ -z "$QUEUE_ID" ]; then
+            echo "Queue not found, skip consumer cleanup: ${QUEUE_NAME}"
+            exit 0
+          fi
+
+          CONSUMER_ID=$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues/${QUEUE_ID}/consumers" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            | jq -r --arg worker_name "$WORKER_NAME" '.result[]? | select(.script_name == $worker_name) | .consumer_id // empty' \
+            | head -n 1)
+
+          if [ -z "$CONSUMER_ID" ]; then
+            echo "Queue consumer binding not found, skip cleanup: ${QUEUE_NAME} -> ${WORKER_NAME}"
+            exit 0
+          fi
+
+          echo "Removing legacy queue consumer binding: ${QUEUE_NAME} -> ${WORKER_NAME}"
+          DELETE_RESPONSE=$(curl -sS -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/queues/${QUEUE_ID}/consumers/${CONSUMER_ID}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          echo "$DELETE_RESPONSE" | jq -e '.success == true' > /dev/null
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: 'hub/packages/worker'
+          command: deploy
+          environment: ${{ env.TARGET_ENV }}
+          secrets: |
+            CLOUDFLARE_ACCOUNT_ID
+            CLOUDFLARE_API_TOKEN
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  deploy-portal:
+    runs-on: ubuntu-latest
+    name: Deploy Portal (Pages - cloud.picgo.app)
+    needs: test-worker
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: deploy
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Clean dist
+        run: rm -rf hub/packages/portal/dist
+
+      - name: Build Portal
+        working-directory: hub/packages/portal
+        run: pnpm build
+        env:
+          # The API is reached through _redirects, so an empty base is intended.
+          VITE_API_BASE: ""
+          GITHUB_REF_NAME: ${{ inputs.target_branch }}
+          # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
+          CF_PAGES_BRANCH: ${{ inputs.target_branch }}
+
+      # Deploying from inside the source checkout lets wrangler record the picgo-hub commit, not this repository's.
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hub
+          command: pages deploy packages/portal/dist --project-name=picgo-portal --branch=${{ inputs.target_branch }} --commit-hash=${{ inputs.head_sha }}
+
+  deploy-admin:
+    runs-on: ubuntu-latest
+    name: Deploy Admin (Pages - admin.picgo.app)
+    needs: test-worker
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Check out fixed source snapshot
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: deploy
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: hub/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: hub
+        run: pnpm install
+
+      - name: Clean dist
+        run: rm -rf hub/packages/admin/dist
+
+      - name: Build Admin
+        working-directory: hub/packages/admin
+        env:
+          # The API is reached through _redirects, so an empty base is intended.
+          VITE_API_BASE: ""
+          GITHUB_REF_NAME: ${{ inputs.target_branch }}
+          # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
+          CF_PAGES_BRANCH: ${{ inputs.target_branch }}
+        run: pnpm build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hub
+          command: pages deploy packages/admin/dist --project-name=picgo-admin --branch=${{ inputs.target_branch }} --commit-hash=${{ inputs.head_sha }}

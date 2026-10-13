@@ -1,0 +1,533 @@
+name: picgo-hub cleanup
+run-name: picgo-hub-cleanup:${{ inputs.request_id }}
+# Migrated from PicGo/picgo-hub .github/workflows/cleanup-preview.yml. picgo-bot dispatches it when a pull request is
+# closed and mirrors each job below back to picgo-hub as a check run named after the job, so job names are a
+# protocol. None of these jobs needs the picgo-hub source; each only validates the dispatch and calls external APIs.
+# This repository is public: keep secrets in step-level env only.
+# yamllint disable rule:line-length
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: UUID identifying the originating picgo-hub event
+        required: true
+        type: string
+      event_name:
+        description: Source event (pull_request)
+        required: true
+        type: string
+      head_sha:
+        description: Pull request head commit
+        required: true
+        type: string
+      base_sha:
+        description: Pull request base commit
+        required: true
+        type: string
+      target_branch:
+        description: Pull request base branch
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+      head_ref:
+        description: Pull request head branch
+        required: true
+        type: string
+      force_pages:
+        description: Unused by cleanup (true or false)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: picgo-hub-cleanup-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+# Derived from inputs only (no secrets). Run scripts read these as shell variables, never through expressions.
+env:
+  # Force Node.js 24 for JS actions running on the deprecated Node 20 runtime (neondatabase/delete-branch-action@v3
+  # internally pins setup-node@v4). Can be removed once Node 24 is the default for every action used here.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PR_NUMBER: ${{ inputs.pr_number }}
+  WORKER_NAME: picgo-worker-pr-${{ inputs.pr_number }}
+  PR_API_DOMAIN: pr-${{ inputs.pr_number }}-dev-api.picgo.app
+  PR_PORTAL_DOMAIN: pr-${{ inputs.pr_number }}-dev-cloud.picgo.app
+  PR_ADMIN_DOMAIN: pr-${{ inputs.pr_number }}-dev-admin.picgo.app
+  PR_MEDIA_DOMAIN: pr-${{ inputs.pr_number }}.picgocloud.com
+
+jobs:
+  # Custom hostnames are listed from the PR's Neon branch, so they must be removed before the branch is deleted.
+  cleanup-custom-hostnames:
+    runs-on: ubuntu-latest
+    name: Cleanup Custom Hostnames
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Delete PR custom hostnames and routes
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID }}
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+        run: |
+          if [ -z "$CF_ZONE_ID" ]; then
+            echo "CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID is empty, skipping custom hostname cleanup."
+            exit 0
+          fi
+
+          BRANCH_NAME="pr-${PR_NUMBER}"
+          BRANCH_INFO=$(curl -fsS -X GET \
+            "https://console.neon.tech/api/v2/projects/${NEON_PROJECT_ID}/branches" \
+            -H "Authorization: Bearer ${NEON_API_KEY}" \
+            -H "Content-Type: application/json")
+          echo "$BRANCH_INFO" | jq -e '.branches | type == "array"' > /dev/null
+          BRANCH_ID=$(echo "$BRANCH_INFO" | jq -r --arg branch_name "$BRANCH_NAME" '.branches[]? | select(.name == $branch_name) | .id // empty')
+
+          if [ -z "$BRANCH_ID" ]; then
+            echo "Neon branch '${BRANCH_NAME}' not found, skipping custom hostname cleanup."
+            exit 0
+          fi
+
+          CONN_URI=$(curl -fsS -X GET \
+            "https://console.neon.tech/api/v2/projects/${NEON_PROJECT_ID}/connection_uri?branch_id=${BRANCH_ID}&role_name=neondb_owner&database_name=neondb" \
+            -H "Authorization: Bearer ${NEON_API_KEY}" \
+            -H "Content-Type: application/json" \
+            | jq -r '.uri // empty')
+
+          if [ -z "$CONN_URI" ]; then
+            echo "Could not get connection URI for '${BRANCH_NAME}'."
+            exit 1
+          fi
+
+          echo "Reading PR custom domain inventory from Neon branch: ${BRANCH_NAME}"
+          DB_RECORDS=$(psql "$CONN_URI" -v ON_ERROR_STOP=1 -Atc \
+            "select coalesce(json_agg(json_build_object('hostname', hostname, 'providerHostnameId', provider_hostname_id)), '[]'::json) from user_custom_domains where provider_hostname_id is not null;")
+
+          if [ "$DB_RECORDS" = "[]" ]; then
+            echo "No PR custom domain records found in ${BRANCH_NAME}."
+            exit 0
+          fi
+
+          fetch_cloudflare_pages() {
+            local base_url="$1"
+            local page=1
+            local total_pages=1
+            local results="[]"
+
+            while [ "$page" -le "$total_pages" ]; do
+              local separator="?"
+              if [[ "$base_url" == *\?* ]]; then
+                separator="&"
+              fi
+
+              local response
+              response=$(curl -sS -X GET \
+                "${base_url}${separator}per_page=50&page=${page}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json")
+
+              echo "$response" | jq -e '.success == true' > /dev/null
+
+              local page_result
+              page_result=$(echo "$response" | jq -c '.result // []')
+              results=$(jq -c --argjson existing "$results" --argjson current "$page_result" -n '$existing + $current')
+
+              local response_page
+              local response_total_pages
+              response_page=$(echo "$response" | jq -r '.result_info.page // empty')
+              response_total_pages=$(echo "$response" | jq -r '.result_info.total_pages // empty')
+
+              if [ -z "$response_page" ] || [ -z "$response_total_pages" ]; then
+                break
+              fi
+
+              page=$((response_page + 1))
+              total_pages="$response_total_pages"
+            done
+
+            printf '%s\n' "$results"
+          }
+
+          echo "Finding DB-backed custom hostnames with origin: ${PR_MEDIA_DOMAIN}"
+          HOSTNAMES=$(fetch_cloudflare_pages "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/custom_hostnames")
+          MATCHES=$(echo "$HOSTNAMES" \
+            | jq -c \
+              --arg origin "$PR_MEDIA_DOMAIN" \
+              --argjson db_records "$DB_RECORDS" \
+              'def has_pr_record($hostname_id; $hostname): any($db_records[]?; .providerHostnameId == $hostname_id and .hostname == $hostname);
+               .[]? | select(.custom_origin_server == $origin and has_pr_record(.id; .hostname)) | {id, hostname}')
+
+          if [ -z "$MATCHES" ]; then
+            echo "No DB-backed PR custom hostnames found for ${PR_MEDIA_DOMAIN}."
+            exit 0
+          fi
+
+          ROUTES=$(fetch_cloudflare_pages "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/workers/routes?match=all")
+
+          echo "$MATCHES" | while IFS= read -r item; do
+            HOSTNAME_ID=$(echo "$item" | jq -r '.id')
+            HOSTNAME=$(echo "$item" | jq -r '.hostname')
+
+            if [ -z "$HOSTNAME_ID" ] || [ -z "$HOSTNAME" ]; then
+              echo "Skipping malformed custom hostname item: $item"
+              continue
+            fi
+
+            echo "Deleting custom hostname ${HOSTNAME} (${HOSTNAME_ID})"
+            DELETE_HOSTNAME_RESPONSE=$(curl -sS -X DELETE \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/custom_hostnames/${HOSTNAME_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json")
+            echo "$DELETE_HOSTNAME_RESPONSE" | jq -e '.success == true' > /dev/null
+
+            ROUTE_PATTERN="${HOSTNAME}/*"
+            ROUTE_ID=$(echo "$ROUTES" \
+              | jq -r \
+                --arg pattern "$ROUTE_PATTERN" \
+                --arg script "$WORKER_NAME" \
+                '.[]? | select(.pattern == $pattern and .script == $script) | .id // empty')
+
+            if [ -n "$ROUTE_ID" ]; then
+              echo "Deleting worker route ${ROUTE_PATTERN} (${ROUTE_ID})"
+              DELETE_ROUTE_RESPONSE=$(curl -sS -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/workers/routes/${ROUTE_ID}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json")
+              echo "$DELETE_ROUTE_RESPONSE" | jq -e '.success == true' > /dev/null
+            else
+              echo "Worker route not found for ${ROUTE_PATTERN}, skipping."
+            fi
+          done
+
+  cleanup-database:
+    runs-on: ubuntu-latest
+    name: Cleanup Neon Branch
+    needs: cleanup-custom-hostnames
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Delete Neon Branch
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch: pr-${{ inputs.pr_number }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+  cleanup-hyperdrive:
+    runs-on: ubuntu-latest
+    name: Cleanup Hyperdrive
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Delete Hyperdrive Config
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          HYPERDRIVE_NAME="picgo-pr-${PR_NUMBER}"
+          echo "Looking for Hyperdrive: $HYPERDRIVE_NAME"
+
+          HYPERDRIVE_ID=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            | jq -r --arg name "$HYPERDRIVE_NAME" '.result[] | select(.name == $name) | .id // empty')
+
+          if [ -n "$HYPERDRIVE_ID" ]; then
+            echo "Deleting Hyperdrive config."
+            curl -s -X DELETE \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/hyperdrive/configs/${HYPERDRIVE_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              | jq '.success'
+          else
+            echo "Hyperdrive not found, skipping."
+          fi
+
+  # Queue cleanup was removed with the CSAM queue pipeline deprecation.
+  cleanup-worker:
+    runs-on: ubuntu-latest
+    name: Cleanup Worker
+    needs: [cleanup-hyperdrive, cleanup-custom-hostnames]
+    if: always() && !cancelled()
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Delete Worker
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "Deleting Worker: ${WORKER_NAME}"
+          curl -s -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            | jq '.success'
+
+  cleanup-dns:
+    runs-on: ubuntu-latest
+    name: Cleanup DNS Records
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      - name: Delete Pages custom domains and DNS records
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID_PICGO_APP }}
+          MEDIA_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID_PICGOCLOUD_COM }}
+        run: |
+          remove_pages_domain() {
+            local project_name="$1"
+            local domain_name="$2"
+
+            echo "Removing Pages custom domain ${domain_name} from ${project_name}"
+            curl -s -X DELETE \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${project_name}/domains/${domain_name}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" > /dev/null || true
+          }
+
+          remove_dns_record() {
+            local domain_name="$1"
+            local record_id
+
+            record_id=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${domain_name}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              | jq -r '.result[0].id // empty')
+
+            if [ -n "$record_id" ]; then
+              echo "Deleting DNS record for ${domain_name}"
+              curl -s -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" > /dev/null || true
+            else
+              echo "DNS record not found for ${domain_name}, skipping."
+            fi
+          }
+
+          remove_pages_domain "picgo-portal" "$PR_PORTAL_DOMAIN"
+          remove_dns_record "$PR_PORTAL_DOMAIN"
+
+          remove_pages_domain "picgo-admin" "$PR_ADMIN_DOMAIN"
+          remove_dns_record "$PR_ADMIN_DOMAIN"
+
+          # Remove the PR media domain's DNS record from the picgocloud.com zone.
+          if [ -n "$MEDIA_ZONE_ID" ]; then
+            MEDIA_RECORD_ID=$(curl -s -X GET \
+              "https://api.cloudflare.com/client/v4/zones/${MEDIA_ZONE_ID}/dns_records?type=CNAME&name=${PR_MEDIA_DOMAIN}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              | jq -r '.result[0].id // empty')
+
+            if [ -n "$MEDIA_RECORD_ID" ]; then
+              echo "Deleting DNS record for ${PR_MEDIA_DOMAIN}"
+              curl -s -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${MEDIA_ZONE_ID}/dns_records/${MEDIA_RECORD_ID}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" > /dev/null || true
+            else
+              echo "DNS record not found for ${PR_MEDIA_DOMAIN}, skipping."
+            fi
+          fi
+
+  comment-cleanup:
+    runs-on: ubuntu-latest
+    name: Comment Cleanup Result
+    needs: [cleanup-database, cleanup-hyperdrive, cleanup-custom-hostnames, cleanup-worker, cleanup-dns]
+    if: always() && !cancelled()
+    steps:
+      - name: Check out trusted CI helpers
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/picgo-hub
+
+      - name: Validate dispatch inputs
+        uses: ./.github/picgo-hub/checkout
+        with:
+          kind: cleanup
+          checkout: 'false'
+          request-id: ${{ inputs.request_id }}
+          event-name: ${{ inputs.event_name }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          target-branch: ${{ inputs.target_branch }}
+          pr-number: ${{ inputs.pr_number }}
+          head-ref: ${{ inputs.head_ref }}
+          force-pages: ${{ inputs.force_pages }}
+
+      # Pull requests: write covers the issue-comment endpoints for a pull request; the App has no Issues permission.
+      - name: Create a pull request comment token
+        id: comment-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PICGO_APP_ID }}
+          private-key: ${{ secrets.PICGO_APP_PRIVATE_KEY }}
+          owner: PicGo
+          repositories: picgo-hub
+          permission-pull-requests: write
+
+      - name: Upsert cleanup comment
+        env:
+          GH_TOKEN: ${{ steps.comment-token.outputs.token }}
+          REPO: PicGo/picgo-hub
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DATABASE_RESULT: ${{ needs.cleanup-database.result }}
+          HYPERDRIVE_RESULT: ${{ needs.cleanup-hyperdrive.result }}
+          CUSTOM_HOSTNAMES_RESULT: ${{ needs.cleanup-custom-hostnames.result }}
+          WORKER_RESULT: ${{ needs.cleanup-worker.result }}
+          DNS_RESULT: ${{ needs.cleanup-dns.result }}
+        run: |
+          COMMENT_MARKER="<!-- pr-preview-cleanup-comment -->"
+
+          format_status() {
+            case "$1" in
+              success) printf '✅' ;;
+              skipped) printf 'Skip' ;;
+              *) printf '❌' ;;
+            esac
+          }
+
+          DATABASE_STATUS=$(format_status "$DATABASE_RESULT")
+          HYPERDRIVE_STATUS=$(format_status "$HYPERDRIVE_RESULT")
+          CUSTOM_HOSTNAMES_STATUS=$(format_status "$CUSTOM_HOSTNAMES_RESULT")
+          WORKER_STATUS=$(format_status "$WORKER_RESULT")
+          DNS_STATUS=$(format_status "$DNS_RESULT")
+
+          if [ "$DATABASE_RESULT" = "success" ] && \
+             [ "$HYPERDRIVE_RESULT" = "success" ] && \
+             [ "$CUSTOM_HOSTNAMES_RESULT" = "success" ] && \
+             [ "$WORKER_RESULT" = "success" ] && \
+             [ "$DNS_RESULT" = "success" ]; then
+            STATUS_LINE="- Status: success"
+            SUMMARY_LINE="> Preview DNS and backend resources cleaned up. Pages deployments are kept."
+          else
+            STATUS_LINE="- Status: failed"
+            SUMMARY_LINE="> Preview cleanup did not complete successfully. Please check the workflow logs."
+          fi
+
+          BODY=$(printf '%s\n' \
+            "$COMMENT_MARKER" \
+            "## PR Preview Environment Cleaned Up" \
+            "" \
+            "$STATUS_LINE" \
+            "- Workflow: [View run](${RUN_URL})" \
+            "" \
+            "| Resource | Job Status |" \
+            "| --- | --- |" \
+            "| Neon Branch | ${DATABASE_STATUS} |" \
+            "| Hyperdrive | ${HYPERDRIVE_STATUS} |" \
+            "| Custom Hostnames | ${CUSTOM_HOSTNAMES_STATUS} |" \
+            "| Worker | ${WORKER_STATUS} |" \
+            "| DNS Records | ${DNS_STATUS} |" \
+            "" \
+            "$SUMMARY_LINE")
+
+          COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[] | select(.user.login == "picgo-bot[bot]") | select(.body | contains("<!-- pr-preview-cleanup-comment -->")) | .id' | head -n 1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" --method PATCH -f body="$BODY" > /dev/null
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --method POST -f body="$BODY" > /dev/null
+          fi

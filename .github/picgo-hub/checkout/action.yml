@@ -1,0 +1,122 @@
+name: Check out fixed picgo-hub snapshot
+description: Validate a forwarded picgo-hub CI dispatch, optionally check out its immutable head commit with a short-lived read-only token, and revoke that token.
+
+inputs:
+  kind:
+    description: The forwarding workflow (preview, cleanup, or deploy); each accepts a different source event.
+    required: true
+  checkout:
+    description: Whether to check out PicGo/picgo-hub; jobs that only call external APIs validate inputs and stop there.
+    default: 'true'
+  path:
+    description: The directory the source is checked out into.
+    default: hub
+  fetch-depth:
+    description: History depth for the source checkout (0 for full history).
+    default: '1'
+  app-id:
+    description: GitHub App ID installed on PicGo/picgo-hub (required when checkout is true).
+    default: ''
+  private-key:
+    description: GitHub App private key (required when checkout is true).
+    default: ''
+  request-id:
+    description: UUID identifying the originating source event.
+    required: true
+  event-name:
+    description: Source event type (pull_request or push).
+    required: true
+  head-sha:
+    description: Immutable source head commit.
+    required: true
+  base-sha:
+    description: Immutable source base commit or the zero SHA.
+    required: true
+  target-branch:
+    description: Source target branch.
+    required: true
+  pr-number:
+    description: Source pull request number or 0 for a push.
+    required: true
+  head-ref:
+    description: Source pull request head branch.
+    required: true
+  force-pages:
+    description: Whether Pages previews must be rebuilt regardless of changes.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate dispatch inputs
+      shell: bash
+      env:
+        WORKFLOW_KIND: ${{ inputs.kind }}
+        REQUEST_ID: ${{ inputs.request-id }}
+        EVENT_NAME: ${{ inputs.event-name }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        TARGET_BRANCH: ${{ inputs.target-branch }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        FORCE_PAGES: ${{ inputs.force-pages }}
+        CHECKOUT: ${{ inputs.checkout }}
+        CHECKOUT_PATH: ${{ inputs.path }}
+        FETCH_DEPTH: ${{ inputs.fetch-depth }}
+      run: |
+        node "$GITHUB_ACTION_PATH/../validate-inputs.mjs"
+        case "$CHECKOUT" in true|false) ;; *) echo '::error::checkout must be true or false.'; exit 1 ;; esac
+        if [ "$CHECKOUT" = 'true' ]; then
+          if ! [[ "$CHECKOUT_PATH" =~ ^[a-z][a-z0-9-]{0,63}$ ]]; then echo '::error::path must be a single lowercase directory name.'; exit 1; fi
+          if ! [[ "$FETCH_DEPTH" =~ ^[0-9]+$ ]]; then echo '::error::fetch-depth must be a non-negative integer.'; exit 1; fi
+        fi
+
+    - name: Create a read-only source token
+      id: app-token
+      if: ${{ inputs.checkout == 'true' }}
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: PicGo
+        repositories: picgo-hub
+        permission-contents: read
+        skip-token-revoke: true
+
+    - name: Check out the immutable source head
+      if: ${{ inputs.checkout == 'true' }}
+      uses: actions/checkout@v5
+      with:
+        repository: PicGo/picgo-hub
+        ref: ${{ inputs.head-sha }}
+        token: ${{ steps.app-token.outputs.token }}
+        persist-credentials: false
+        fetch-depth: ${{ inputs.fetch-depth }}
+        path: ${{ inputs.path }}
+        show-progress: false
+
+    - name: Verify the checked-out commit
+      if: ${{ inputs.checkout == 'true' }}
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        HEAD_SHA: ${{ inputs.head-sha }}
+      run: |
+        actual=$(git rev-parse HEAD)
+        if [ "$actual" != "$HEAD_SHA" ]; then
+          echo "::error::Checked out $actual instead of $HEAD_SHA."
+          exit 1
+        fi
+
+    - name: Revoke the source token
+      if: ${{ always() && steps.app-token.outputs.token != '' }}
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.app-token.outputs.token }}
+      run: |
+        curl --fail-with-body --silent --show-error --location \
+          --request DELETE \
+          --header 'Accept: application/vnd.github+json' \
+          --header "Authorization: Bearer $APP_TOKEN" \
+          --header 'X-GitHub-Api-Version: 2022-11-28' \
+          https://api.github.com/installation/token
