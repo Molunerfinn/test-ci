@@ -53,9 +53,16 @@ env:
   TARGET_BRANCH: ${{ inputs.target_branch }}
 
 jobs:
+  # test:local is split into shards, each with its own Postgres; picgo-bot folds every "Test Worker (<i>/<n>)" job into
+  # the single "Test Worker" check on picgo-hub, so changing the shard count only needs the matrix, the name, and the
+  # --shard total below to agree.
   test-worker:
     runs-on: ubuntu-latest
-    name: Test Worker
+    name: Test Worker (${{ matrix.shard }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     services:
       postgres:
         image: postgres:18
@@ -109,17 +116,26 @@ jobs:
         working-directory: hub
         run: pnpm install
 
+      # The fast, unsharded suites run once, in the first shard, still ahead of test:local.
       - name: Test Castaly deployment configuration
+        if: matrix.shard == 1
         working-directory: hub/packages/worker
         run: pnpm test:castaly-config
 
+      - name: Run pure worker tests
+        if: matrix.shard == 1
+        working-directory: hub/packages/worker
+        env:
+          UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
+        run: pnpm test:pure
+
+      # No "--" before --shard: pnpm 10 would forward it literally and vitest ignores every flag after "--".
       - name: Run worker tests
         working-directory: hub/packages/worker
         env:
           UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
-        run: |
-          pnpm test:pure
-          pnpm test:local
+          SHARD: ${{ matrix.shard }}
+        run: pnpm test:local --shard="${SHARD}/4"
 
   deploy-worker:
     runs-on: ubuntu-latest

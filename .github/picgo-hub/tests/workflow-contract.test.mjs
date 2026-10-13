@@ -11,13 +11,18 @@ const read = (file) => readFileSync(path.join(root, file), 'utf8');
 
 const EXPECTED_INPUTS = ['request_id', 'event_name', 'head_sha', 'base_sha', 'target_branch', 'pr_number', 'head_ref', 'force_pages'];
 
+// picgo-bot folds every job named "Test Worker (<i>/<n>)" into the single "Test Worker" check, so the shard count lives
+// only in the matrix; the test below keeps the matrix, the name, and the --shard total consistent.
+const SHARDED_TEST_WORKER = 'Test Worker (${{ matrix.shard }}/4)';
+const SHARD_JOB_PATTERN = /^Test Worker \((\d+)\/(\d+)\)$/u;
+
 const WORKFLOWS = [
   {
     file: '.github/workflows/picgo-hub-preview.yml',
     prefix: 'picgo-hub-preview',
     kind: 'preview',
     jobs: [
-      'Test Worker',
+      SHARDED_TEST_WORKER,
       'Setup Neon Branch && Hyperdrive',
       'Deploy PR Worker (API)',
       'Detect Pages Changes',
@@ -47,7 +52,7 @@ const WORKFLOWS = [
     file: '.github/workflows/picgo-hub-deploy.yml',
     prefix: 'picgo-hub-deploy',
     kind: 'deploy',
-    jobs: ['Test Worker', 'Deploy Worker (API)', 'Deploy Portal (Pages - cloud.picgo.app)', 'Deploy Admin (Pages - admin.picgo.app)'],
+    jobs: [SHARDED_TEST_WORKER, 'Deploy Worker (API)', 'Deploy Portal (Pages - cloud.picgo.app)', 'Deploy Admin (Pages - admin.picgo.app)'],
     concurrencyGroup: 'picgo-hub-deploy-${{ inputs.target_branch }}',
     cancelInProgress: 'false',
   },
@@ -148,6 +153,20 @@ for (const workflow of WORKFLOWS) {
     });
     assert.deepEqual(names, workflow.jobs);
   });
+
+  if (workflow.jobs.includes(SHARDED_TEST_WORKER)) {
+    test(`${workflow.prefix}: Test Worker shards render as "Test Worker (<i>/<n>)" and cover every shard`, () => {
+      const testWorker = jobsOf(text).find((job) => job.id === 'test-worker');
+      const body = testWorker.lines.join('\n');
+      const total = Number(/^ {4}name: Test Worker \(\$\{\{ matrix\.shard \}\}\/(\d+)\)$/mu.exec(body)?.[1]);
+      assert.ok(total > 0, 'Test Worker name must carry the shard total');
+      assert.match(body, /^ {4}strategy:\n {6}fail-fast: false\n {6}matrix:\n {8}shard: \[[\d, ]+\]$/mu);
+      const shards = /^ {8}shard: \[([\d, ]+)\]$/mu.exec(body)[1].split(',').map((value) => Number(value.trim()));
+      assert.deepEqual(shards, Array.from({ length: total }, (_, index) => index + 1));
+      for (const shard of shards) assert.match(`Test Worker (${shard}/${total})`, SHARD_JOB_PATTERN);
+      assert.match(body, new RegExp(`^ {10}SHARD: \\$\\{\\{ matrix\\.shard \\}\\}\\n {8}run: pnpm test:local --shard="\\$\\{SHARD\\}/${total}"$`, 'mu'));
+    });
+  }
 
   test(`${workflow.prefix}: concurrency is keyed and cancellable as agreed`, () => {
     const concurrency = topLevel(text, 'concurrency');

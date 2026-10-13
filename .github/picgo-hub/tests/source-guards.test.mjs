@@ -18,14 +18,37 @@ function job(source, id) {
   return body;
 }
 
+/** Steps of a job, each as text starting at its `- name:` line. */
+function steps(body) {
+  return body.split(/\n(?= {6}- )/).slice(1);
+}
+
 test('every deployment tests Castaly config, then pure tests before local tests', () => {
   for (const source of [preview, deploy]) {
     const testJob = job(source, 'test-worker');
     assert.match(testJob, /pnpm test:castaly-config/);
     assert.match(testJob, /^\s+(?:run: )?pnpm test:pure\s*$/m);
+    assert.ok(testJob.indexOf('pnpm test:castaly-config') < testJob.indexOf('pnpm test:local'));
     assert.ok(testJob.indexOf('pnpm test:pure') < testJob.indexOf('pnpm test:local'));
   }
   assert.match(job(preview, 'test-worker'), /node --test \.\.\/\.\.\/\.github\/scripts\/preview-pages\.test\.mjs/);
+});
+
+test('the unsharded suites run exactly once, in shard 1, and test:local runs sharded in every shard', () => {
+  for (const source of [preview, deploy]) {
+    const all = steps(job(source, 'test-worker'));
+    const unsharded = all.filter((step) => /pnpm test:castaly-config|pnpm test:pure|preview-pages\.test\.mjs/.test(step));
+    assert.ok(unsharded.length > 0);
+    for (const step of unsharded) {
+      assert.match(step, /^ {8}if: matrix\.shard == 1$/m, step);
+      assert.doesNotMatch(step, /test:local/, 'test:local must not be limited to shard 1');
+    }
+    const local = all.filter((step) => /pnpm test:local/.test(step));
+    assert.equal(local.length, 1);
+    assert.doesNotMatch(local[0], /^ {8}if:/m, 'test:local must run in every shard');
+    // pnpm 10 forwards a literal "--" and vitest ignores every flag after it, which would silently run all files per shard.
+    assert.match(local[0], /pnpm test:local --shard=/);
+  }
 });
 
 test('deployments never read or register Castaly production secrets', () => {
