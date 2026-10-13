@@ -59,16 +59,10 @@ env:
   PR_MEDIA_DOMAIN: pr-${{ inputs.pr_number }}.picgocloud.com
 
 jobs:
-  # Worker unit tests gate the Worker, Portal, and Admin deployments. test:local is split into shards, each with its own
-  # Postgres; picgo-bot folds every "Test Worker (<i>/<n>)" job into the single "Test Worker" check on picgo-hub, so
-  # changing the shard count only needs the matrix, the name, and the --shard total below to agree.
+  # Worker unit tests gate the Worker, Portal, and Admin deployments.
   test-worker:
     runs-on: ubuntu-latest
-    name: Test Worker (${{ matrix.shard }}/4)
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
+    name: Test Worker
     services:
       postgres:
         image: postgres:18
@@ -121,9 +115,7 @@ jobs:
         working-directory: hub
         run: pnpm install
 
-      # The fast, unsharded suites run once, in the first shard, still ahead of test:local.
-      - name: Run unsharded worker tests
-        if: matrix.shard == 1
+      - name: Run fast worker tests
         working-directory: hub/packages/worker
         env:
           UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
@@ -132,13 +124,11 @@ jobs:
           node --test ../../.github/scripts/preview-pages.test.mjs
           pnpm test:pure
 
-      # No "--" before --shard: pnpm 10 would forward it literally and vitest ignores every flag after "--".
       - name: Run worker tests
         working-directory: hub/packages/worker
         env:
           UNIT_TEST_HYPERDRIVE_CONNECTION_STRING: postgres://postgres:postgres@localhost:5432/picgo_test?sslmode=disable
-          SHARD: ${{ matrix.shard }}
-        run: pnpm test:local --shard="${SHARD}/4"
+        run: pnpm test:local
 
   # Creates the Neon branch, runs migrations, and creates or updates Hyperdrive. Every step is idempotent, so a run
   # cancelled mid-setup by a newer push is repaired by the next run instead of orphaning the preview environment.

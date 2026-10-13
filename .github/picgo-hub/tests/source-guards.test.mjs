@@ -34,20 +34,13 @@ test('every deployment tests Castaly config, then pure tests before local tests'
   assert.match(job(preview, 'test-worker'), /node --test \.\.\/\.\.\/\.github\/scripts\/preview-pages\.test\.mjs/);
 });
 
-test('the unsharded suites run exactly once, in shard 1, and test:local runs sharded in every shard', () => {
+test('Test Worker is a single job that runs test:local over every file', () => {
   for (const source of [preview, deploy]) {
-    const all = steps(job(source, 'test-worker'));
-    const unsharded = all.filter((step) => /pnpm test:castaly-config|pnpm test:pure|preview-pages\.test\.mjs/.test(step));
-    assert.ok(unsharded.length > 0);
-    for (const step of unsharded) {
-      assert.match(step, /^ {8}if: matrix\.shard == 1$/m, step);
-      assert.doesNotMatch(step, /test:local/, 'test:local must not be limited to shard 1');
-    }
-    const local = all.filter((step) => /pnpm test:local/.test(step));
+    const body = job(source, 'test-worker');
+    assert.doesNotMatch(body, /matrix|--shard/, 'test:local must run every file in one job');
+    const local = steps(body).filter((step) => /pnpm test:local/.test(step));
     assert.equal(local.length, 1);
-    assert.doesNotMatch(local[0], /^ {8}if:/m, 'test:local must run in every shard');
-    // pnpm 10 forwards a literal "--" and vitest ignores every flag after it, which would silently run all files per shard.
-    assert.match(local[0], /pnpm test:local --shard=/);
+    assert.doesNotMatch(local[0], /^ {8}if:/m, 'test:local must always run');
   }
 });
 
