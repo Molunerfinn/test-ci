@@ -251,9 +251,10 @@ test('deploy: Edge staging deploys from main inside the existing Worker job', ()
   const edge = steps.find((step) => /name: Deploy Edge Worker \(staging\)/u.test(step));
 
   assert.ok(edge, 'missing Edge staging deploy step');
-  assert.match(edge, /if: inputs\.target_branch == 'main'/u);
+  assert.match(edge, /if: inputs\.target_branch == 'main' && steps\.edge-config\.outputs\.present == 'true'/u);
   assert.match(edge, /workingDirectory: 'hub\/packages\/worker'/u);
   assert.match(edge, /command: deploy -c wrangler\.edge\.jsonc/u);
+  assert.match(text, /name: Detect Edge Worker config/u);
   assert.match(text, /sed -i .*wrangler\.jsonc/u);
   assert.match(text, /sed -i .*wrangler\.edge\.jsonc/u);
 });

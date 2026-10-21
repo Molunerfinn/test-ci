@@ -270,8 +270,18 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
+      - name: Detect Edge Worker config
+        id: edge-config
+        working-directory: hub/packages/worker
+        run: |
+          if [ -f wrangler.edge.jsonc ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Deploy Edge Worker (staging)
-        if: inputs.target_branch == 'main'
+        if: inputs.target_branch == 'main' && steps.edge-config.outputs.present == 'true'
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
