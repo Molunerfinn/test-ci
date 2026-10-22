@@ -285,6 +285,8 @@ test('preview: deploys the PR Edge Worker and targets it from preview custom dom
   assert.match(text, /EDGE_WORKER_NAME: picgo-edge-pr-\$\{\{ inputs\.pr_number \}\}/u);
   assert.match(text, /CUSTOM_DOMAIN_ROUTE_TARGET.*EDGE_WORKER_NAME/u);
   assert.match(text, /name: Prepare Edge Worker config for PR/u);
+  assert.match(text, /Refusing to deploy an unexpected Edge Worker name/u);
+  assert.doesNotMatch(edge, /environment: production/u);
 });
 
 test('cleanup: removes the PR Edge Worker and its media route', () => {
@@ -292,6 +294,8 @@ test('cleanup: removes the PR Edge Worker and its media route', () => {
   assert.match(text, /EDGE_WORKER_NAME: picgo-edge-pr-\$\{\{ inputs\.pr_number \}\}/u);
   assert.match(text, /for script in "\$WORKER_NAME" "\$EDGE_WORKER_NAME"; do/u);
   assert.match(text, /MEDIA_ROUTE_PATTERN="\$\{HOSTNAME\}\/m\/\*"/u);
+  assert.match(text, /Refusing to delete an unexpected Worker name/u);
+  assert.match(text, /Refusing to delete an unexpected Edge Worker name/u);
 });
 
 test('PR comments use a pull-requests:write App token and match picgo-bot comments', () => {

@@ -98,6 +98,15 @@ jobs:
           NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
         run: |
+          case "$WORKER_NAME" in
+            picgo-worker-pr-*) ;;
+            *) echo "::error::Refusing to clean up an unexpected Worker name."; exit 1 ;;
+          esac
+          case "$EDGE_WORKER_NAME" in
+            picgo-edge-pr-*) ;;
+            *) echo "::error::Refusing to clean up an unexpected Edge Worker name."; exit 1 ;;
+          esac
+
           if [ -z "$CF_ZONE_ID" ]; then
             echo "CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID is empty, skipping custom hostname cleanup."
             exit 0
@@ -356,6 +365,15 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          case "$WORKER_NAME" in
+            picgo-worker-pr-*) ;;
+            *) echo "::error::Refusing to delete an unexpected Worker name."; exit 1 ;;
+          esac
+          case "$EDGE_WORKER_NAME" in
+            picgo-edge-pr-*) ;;
+            *) echo "::error::Refusing to delete an unexpected Edge Worker name."; exit 1 ;;
+          esac
+
           for script in "$WORKER_NAME" "$EDGE_WORKER_NAME"; do
             echo "Deleting Worker: ${script}"
             curl -s -X DELETE \

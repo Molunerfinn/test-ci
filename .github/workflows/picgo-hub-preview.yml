@@ -373,6 +373,11 @@ jobs:
           SETUP_HYPERDRIVE_ID: ${{ needs.setup-env.outputs.hyperdrive_id }}
           FETCHED_HYPERDRIVE_ID: ${{ steps.fetch-hyperdrive.outputs.id }}
         run: |
+          case "$EDGE_WORKER_NAME" in
+            picgo-edge-pr-*) ;;
+            *) echo "::error::Refusing to deploy an unexpected Edge Worker name."; exit 1 ;;
+          esac
+
           if [ ! -f wrangler.edge.jsonc ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             exit 0
