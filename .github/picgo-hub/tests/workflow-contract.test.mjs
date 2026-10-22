@@ -259,6 +259,19 @@ test('deploy: Edge staging deploys from main inside the existing Worker job', ()
   assert.match(text, /sed -i .*wrangler\.edge\.jsonc/u);
 });
 
+test('deploy: Edge production deploys from production inside the existing Worker job', () => {
+  const text = read('.github/workflows/picgo-hub-deploy.yml');
+  const deploy = jobsOf(text).find((job) => job.id === 'deploy-worker');
+  const steps = stepsOf(deploy);
+  const edge = steps.find((step) => /name: Deploy Edge Worker \(production\)/u.test(step));
+
+  assert.ok(edge, 'missing Edge production deploy step');
+  assert.match(edge, /if: inputs\.target_branch == 'production' && steps\.edge-config\.outputs\.present == 'true'/u);
+  assert.match(edge, /workingDirectory: 'hub\/packages\/worker'/u);
+  assert.match(edge, /command: deploy -c wrangler\.edge\.jsonc/u);
+  assert.match(edge, /environment: production/u);
+});
+
 test('PR comments use a pull-requests:write App token and match picgo-bot comments', () => {
   for (const file of ['.github/workflows/picgo-hub-preview.yml', '.github/workflows/picgo-hub-cleanup.yml']) {
     const text = read(file);
