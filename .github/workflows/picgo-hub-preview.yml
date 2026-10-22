@@ -53,6 +53,7 @@ concurrency:
 env:
   PR_NUMBER: ${{ inputs.pr_number }}
   WORKER_NAME: picgo-worker-pr-${{ inputs.pr_number }}
+  EDGE_WORKER_NAME: picgo-edge-pr-${{ inputs.pr_number }}
   PR_API_DOMAIN: pr-${{ inputs.pr_number }}-dev-api.picgo.app
   PR_PORTAL_DOMAIN: pr-${{ inputs.pr_number }}-dev-cloud.picgo.app
   PR_ADMIN_DOMAIN: pr-${{ inputs.pr_number }}-dev-admin.picgo.app
@@ -354,10 +355,64 @@ jobs:
           sed -i "s|\"CUSTOM_DOMAIN_CNAME_TARGET\": \"dev.picgocloud.com\"|\"CUSTOM_DOMAIN_CNAME_TARGET\": \"${PR_MEDIA_DOMAIN}\"|g" wrangler.jsonc
           sed -i "s|\"CUSTOM_DOMAIN_WORKER_SCRIPT_NAME\": \"picgo-worker-staging\"|\"CUSTOM_DOMAIN_WORKER_SCRIPT_NAME\": \"${WORKER_NAME}\"|g" wrangler.jsonc
 
+          # New custom domains created from this preview must route their media
+          # path to this preview's Edge Worker, never to staging or production.
+          # Match both the commented rollout placeholder and the active staging value.
+          sed -i "s|// \"CUSTOM_DOMAIN_ROUTE_TARGET\": \"picgo-edge-staging\"|\"CUSTOM_DOMAIN_ROUTE_TARGET\": \"${EDGE_WORKER_NAME}\"|g" wrangler.jsonc
+          sed -i "s|\"CUSTOM_DOMAIN_ROUTE_TARGET\": \"picgo-edge-staging\"|\"CUSTOM_DOMAIN_ROUTE_TARGET\": \"${EDGE_WORKER_NAME}\"|g" wrangler.jsonc
+
           # Enable PR routes (API + media domain)
           sed -i "s|// \"routes\": \[{ \"pattern\": \"__PR_API_DOMAIN__\", \"custom_domain\": true }, { \"pattern\": \"__PR_MEDIA_DOMAIN__\", \"custom_domain\": true }, { \"pattern\": \"__PR_MEDIA_DOMAIN__/\*\", \"zone_name\": \"picgocloud.com\" }\], // __PR_ROUTES__|\"routes\": [{ \"pattern\": \"${PR_API_DOMAIN}\", \"custom_domain\": true }, { \"pattern\": \"${PR_MEDIA_DOMAIN}\", \"custom_domain\": true }, { \"pattern\": \"${PR_MEDIA_DOMAIN}/*\", \"zone_name\": \"picgocloud.com\" }],|g" wrangler.jsonc
 
           # The patched file is deliberately not printed: this repository's logs are public.
+
+      - name: Prepare Edge Worker config for PR
+        id: edge-config
+        working-directory: hub/packages/worker
+        env:
+          SETUP_HYPERDRIVE_ID: ${{ needs.setup-env.outputs.hyperdrive_id }}
+          FETCHED_HYPERDRIVE_ID: ${{ steps.fetch-hyperdrive.outputs.id }}
+        run: |
+          if [ ! -f wrangler.edge.jsonc ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HYPERDRIVE_ID="$SETUP_HYPERDRIVE_ID"
+          if [ -z "$HYPERDRIVE_ID" ]; then
+            HYPERDRIVE_ID="$FETCHED_HYPERDRIVE_ID"
+          fi
+          if ! [[ "$HYPERDRIVE_ID" =~ ^[A-Za-z0-9-]+$ ]]; then
+            echo "::error::Malformed Hyperdrive ID."
+            exit 1
+          fi
+
+          # Preview Edge Workers stay route-less: they exist so preview custom
+          # domains target a same-environment script. Staging keeps owning
+          # dev.picgocloud.com/m/*, and production keeps owning production routes.
+          export HYPERDRIVE_ID
+          node - <<'NODE'
+          const fs = require('fs');
+          const file = 'wrangler.edge.jsonc';
+          let text = fs.readFileSync(file, 'utf8');
+          const replace = (pattern, value) => {
+            if (!pattern.test(text)) throw new Error(`missing pattern: ${pattern}`);
+            text = text.replace(pattern, value);
+          };
+          replace(/"name":\s*"picgo-edge-staging"/, `"name": "${process.env.EDGE_WORKER_NAME}"`);
+          replace(/"routes": \[\s*\{[\s\S]*?\}\s*\],/, '"routes": [],');
+          replace(/"DEFAULT_MEDIA_HOST":\s*"dev\.picgocloud\.com"/, `"DEFAULT_MEDIA_HOST": "${process.env.PR_MEDIA_DOMAIN}"`);
+          replace(/"SERVICE_NAME":\s*"picgo-edge"/, `"SERVICE_NAME": "${process.env.EDGE_WORKER_NAME}"`);
+          replace(/"DEPLOY_ENV":\s*"staging"/, '"DEPLOY_ENV": "preview"');
+          text = text.split('__HYPERDRIVE_ID__').join(process.env.HYPERDRIVE_ID);
+          fs.writeFileSync(file, text);
+          NODE
+
+          if grep -q '__HYPERDRIVE_ID__' wrangler.edge.jsonc; then
+            echo "::error::Unreplaced Hyperdrive placeholder remains in wrangler.edge.jsonc."
+            exit 1
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Remove legacy Queue consumer binding
         env:
@@ -420,6 +475,15 @@ jobs:
           CLOUDFLARE_CUSTOM_HOSTNAMES_API_TOKEN: ${{ secrets.CLOUDFLARE_CUSTOM_HOSTNAMES_API_TOKEN }}
           CREEM_API_KEY: ${{ secrets.CREEM_API_KEY }}
           CREEM_WEBHOOK_SECRET: ${{ secrets.CREEM_WEBHOOK_SECRET }}
+
+      - name: Deploy Edge Worker (PR)
+        if: steps.edge-config.outputs.present == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: 'hub/packages/worker'
+          command: deploy -c wrangler.edge.jsonc
 
   # Decides whether the Portal/Admin previews are missing or stale. The source is the PR head itself (not a local
   # merge commit), so the commit Cloudflare Pages recorded for the last deployment stays reachable for git diff.
