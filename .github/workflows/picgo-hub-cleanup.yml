@@ -56,6 +56,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   PR_NUMBER: ${{ inputs.pr_number }}
   WORKER_NAME: picgo-worker-pr-${{ inputs.pr_number }}
+  EDGE_WORKER_NAME: picgo-edge-pr-${{ inputs.pr_number }}
   PR_API_DOMAIN: pr-${{ inputs.pr_number }}-dev-api.picgo.app
   PR_PORTAL_DOMAIN: pr-${{ inputs.pr_number }}-dev-cloud.picgo.app
   PR_ADMIN_DOMAIN: pr-${{ inputs.pr_number }}-dev-admin.picgo.app
@@ -97,6 +98,15 @@ jobs:
           NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
           NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
         run: |
+          case "$WORKER_NAME" in
+            picgo-worker-pr-*) ;;
+            *) echo "::error::Refusing to clean up an unexpected Worker name."; exit 1 ;;
+          esac
+          case "$EDGE_WORKER_NAME" in
+            picgo-edge-pr-*) ;;
+            *) echo "::error::Refusing to clean up an unexpected Edge Worker name."; exit 1 ;;
+          esac
+
           if [ -z "$CF_ZONE_ID" ]; then
             echo "CLOUDFLARE_CUSTOM_HOSTNAMES_ZONE_ID is empty, skipping custom hostname cleanup."
             exit 0
@@ -224,6 +234,24 @@ jobs:
             else
               echo "Worker route not found for ${ROUTE_PATTERN}, skipping."
             fi
+
+            MEDIA_ROUTE_PATTERN="${HOSTNAME}/m/*"
+            MEDIA_ROUTE_ID=$(echo "$ROUTES" \
+              | jq -r \
+                --arg pattern "$MEDIA_ROUTE_PATTERN" \
+                --arg script "$EDGE_WORKER_NAME" \
+                '.[]? | select(.pattern == $pattern and .script == $script) | .id // empty')
+
+            if [ -n "$MEDIA_ROUTE_ID" ]; then
+              echo "Deleting worker route ${MEDIA_ROUTE_PATTERN} (${MEDIA_ROUTE_ID})"
+              DELETE_MEDIA_ROUTE_RESPONSE=$(curl -sS -X DELETE \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/workers/routes/${MEDIA_ROUTE_ID}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json")
+              echo "$DELETE_MEDIA_ROUTE_RESPONSE" | jq -e '.success == true' > /dev/null
+            else
+              echo "Worker route not found for ${MEDIA_ROUTE_PATTERN}, skipping."
+            fi
           done
 
   cleanup-database:
@@ -337,11 +365,22 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          echo "Deleting Worker: ${WORKER_NAME}"
-          curl -s -X DELETE \
-            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            | jq '.success'
+          case "$WORKER_NAME" in
+            picgo-worker-pr-*) ;;
+            *) echo "::error::Refusing to delete an unexpected Worker name."; exit 1 ;;
+          esac
+          case "$EDGE_WORKER_NAME" in
+            picgo-edge-pr-*) ;;
+            *) echo "::error::Refusing to delete an unexpected Edge Worker name."; exit 1 ;;
+          esac
+
+          for script in "$WORKER_NAME" "$EDGE_WORKER_NAME"; do
+            echo "Deleting Worker: ${script}"
+            curl -s -X DELETE \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${script}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              | jq '.success'
+          done
 
   cleanup-dns:
     runs-on: ubuntu-latest
@@ -520,6 +559,7 @@ jobs:
             "| Hyperdrive | ${HYPERDRIVE_STATUS} |" \
             "| Custom Hostnames | ${CUSTOM_HOSTNAMES_STATUS} |" \
             "| Worker | ${WORKER_STATUS} |" \
+            "| Edge Worker | ${WORKER_STATUS} |" \
             "| DNS Records | ${DNS_STATUS} |" \
             "" \
             "$SUMMARY_LINE")

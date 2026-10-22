@@ -272,6 +272,32 @@ test('deploy: Edge production deploys from production inside the existing Worker
   assert.match(edge, /environment: production/u);
 });
 
+test('preview: deploys the PR Edge Worker and targets it from preview custom domains', () => {
+  const text = read('.github/workflows/picgo-hub-preview.yml');
+  const deploy = jobsOf(text).find((job) => job.id === 'deploy-worker');
+  const steps = stepsOf(deploy);
+  const edge = steps.find((step) => /name: Deploy Edge Worker \(PR\)/u.test(step));
+
+  assert.ok(edge, 'missing Edge PR deploy step');
+  assert.match(edge, /if: steps\.edge-config\.outputs\.present == 'true'/u);
+  assert.match(edge, /workingDirectory: 'hub\/packages\/worker'/u);
+  assert.match(edge, /command: deploy -c wrangler\.edge\.jsonc/u);
+  assert.match(text, /EDGE_WORKER_NAME: picgo-edge-pr-\$\{\{ inputs\.pr_number \}\}/u);
+  assert.match(text, /CUSTOM_DOMAIN_ROUTE_TARGET.*EDGE_WORKER_NAME/u);
+  assert.match(text, /name: Prepare Edge Worker config for PR/u);
+  assert.match(text, /Refusing to deploy an unexpected Edge Worker name/u);
+  assert.doesNotMatch(edge, /environment: production/u);
+});
+
+test('cleanup: removes the PR Edge Worker and its media route', () => {
+  const text = read('.github/workflows/picgo-hub-cleanup.yml');
+  assert.match(text, /EDGE_WORKER_NAME: picgo-edge-pr-\$\{\{ inputs\.pr_number \}\}/u);
+  assert.match(text, /for script in "\$WORKER_NAME" "\$EDGE_WORKER_NAME"; do/u);
+  assert.match(text, /MEDIA_ROUTE_PATTERN="\$\{HOSTNAME\}\/m\/\*"/u);
+  assert.match(text, /Refusing to delete an unexpected Worker name/u);
+  assert.match(text, /Refusing to delete an unexpected Edge Worker name/u);
+});
+
 test('PR comments use a pull-requests:write App token and match picgo-bot comments', () => {
   for (const file of ['.github/workflows/picgo-hub-preview.yml', '.github/workflows/picgo-hub-cleanup.yml']) {
     const text = read(file);
