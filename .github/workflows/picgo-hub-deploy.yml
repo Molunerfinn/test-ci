@@ -174,7 +174,7 @@ jobs:
           DATABASE_URL: ${{ inputs.target_branch == 'production' && secrets.DATABASE_URL_PROD || secrets.DATABASE_URL_STAGING }}
         run: pnpm db:migrate
 
-      - name: Replace placeholders in wrangler.jsonc
+      - name: Replace Worker config placeholders
         working-directory: hub/packages/worker
         env:
           PROD_HYPERDRIVE_ID: ${{ vars.CLOUDFLARE_HYPERDRIVE_ID }}
@@ -192,6 +192,13 @@ jobs:
             exit 1
           fi
           sed -i "s/__HYPERDRIVE_ID__/${HYPERDRIVE_ID}/g" wrangler.jsonc
+          if [ -f wrangler.edge.jsonc ]; then
+            sed -i "s/__HYPERDRIVE_ID__/${HYPERDRIVE_ID}/g" wrangler.edge.jsonc
+            if grep -q "__HYPERDRIVE_ID__" wrangler.edge.jsonc; then
+              echo "::error::Unreplaced Hyperdrive placeholder remains in wrangler.edge.jsonc."
+              exit 1
+            fi
+          fi
 
       - name: Set Environment Name
         id: set-env
@@ -259,6 +266,29 @@ jobs:
           secrets: |
             CLOUDFLARE_ACCOUNT_ID
             CLOUDFLARE_API_TOKEN
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Detect Edge Worker config
+        id: edge-config
+        working-directory: hub/packages/worker
+        run: |
+          if [ -f wrangler.edge.jsonc ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy Edge Worker (staging)
+        if: inputs.target_branch == 'main' && steps.edge-config.outputs.present == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: 'hub/packages/worker'
+          command: deploy -c wrangler.edge.jsonc
+          environment: ${{ env.TARGET_ENV }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
