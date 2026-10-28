@@ -599,6 +599,8 @@ jobs:
         run: pnpm build
         env:
           VITE_API_BASE: https://${{ env.PR_API_DOMAIN }}
+          # Public Turnstile site key for checkout verification; PR Workers verify against the NONPROD Secrets Store secret.
+          VITE_TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY_NONPROD }}
           GITHUB_REF_NAME: ${{ inputs.head_ref }}
           # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
           CF_PAGES_BRANCH: ${{ inputs.head_ref }}

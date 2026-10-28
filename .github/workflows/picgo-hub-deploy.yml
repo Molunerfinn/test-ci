@@ -358,6 +358,8 @@ jobs:
         env:
           # The API is reached through _redirects, so an empty base is intended.
           VITE_API_BASE: ""
+          # Public Turnstile site key for checkout verification; must match the Worker's Secrets Store secret (PROD on production, NONPROD on staging).
+          VITE_TURNSTILE_SITE_KEY: ${{ inputs.target_branch == 'production' && vars.TURNSTILE_SITE_KEY_PRODUCTION || vars.TURNSTILE_SITE_KEY_NONPROD }}
           GITHUB_REF_NAME: ${{ inputs.target_branch }}
           # vite reads CF_PAGES_BRANCH first; unlike GITHUB_REF_NAME it is not a runner default, so it cannot fall back to this repository's branch.
           CF_PAGES_BRANCH: ${{ inputs.target_branch }}
